@@ -8,8 +8,8 @@ import (
 )
 
 type AuthService interface {
-	Register(ctx context.Context, req *request.RegisterRequest) (*response.AuthResponse, error)
-	Login(ctx context.Context, req *request.LoginRequest) (*response.AuthResponse, error)
+	Register(ctx context.Context, req *request.RegisterRequest, ipAddress, userAgent string) (*response.AuthResponse, error)
+	Login(ctx context.Context, req *request.LoginRequest, ipAddress, userAgent string) (*response.AuthResponse, error)
 	RefreshToken(ctx context.Context, req *request.RefreshTokenRequest) (*response.TokenResponse, error)
 	Logout(ctx context.Context, req *request.LogoutRequest) error
 	LogoutAll(ctx context.Context, userID string) error

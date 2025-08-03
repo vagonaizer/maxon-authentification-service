@@ -7,20 +7,22 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/vagonaizer/authenitfication-service/internal/config"
 	"github.com/vagonaizer/authenitfication-service/internal/infrastructure/database/postgres"
+	postgresrepos "github.com/vagonaizer/authenitfication-service/internal/infrastructure/database/postgres/repositories"
 	"github.com/vagonaizer/authenitfication-service/internal/infrastructure/database/redis"
 	"github.com/vagonaizer/authenitfication-service/internal/infrastructure/messaging/kafka"
+	"github.com/vagonaizer/authenitfication-service/internal/services"
 	grpcserver "github.com/vagonaizer/authenitfication-service/internal/transport/grpc"
+	grpchandlers "github.com/vagonaizer/authenitfication-service/internal/transport/grpc/handlers"
+	grpcinterceptors "github.com/vagonaizer/authenitfication-service/internal/transport/grpc/interceptors"
 	httpserver "github.com/vagonaizer/authenitfication-service/internal/transport/http"
+	httphandlers "github.com/vagonaizer/authenitfication-service/internal/transport/http/handlers"
+	httpmiddleware "github.com/vagonaizer/authenitfication-service/internal/transport/http/middleware"
+	"github.com/vagonaizer/authenitfication-service/pkg/auth"
 	"github.com/vagonaizer/authenitfication-service/pkg/logger"
 )
-
-// Type aliases for Wire
-type AccessTokenExpiry time.Duration
-type RefreshTokenExpiry time.Duration
 
 type App struct {
 	cfg        *config.Config
@@ -32,24 +34,106 @@ type App struct {
 	grpcServer *grpcserver.Server
 }
 
-func NewApp(
-	cfg *config.Config,
-	logger *logger.Logger,
-	db *postgres.DB,
-	redis *redis.Client,
-	producer *kafka.Producer,
-	httpServer *httpserver.Server,
-	grpcServer *grpcserver.Server,
-) *App {
+func NewApp() (*App, error) {
+	// Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+
+	// Initialize logger
+	log := logger.New(
+		cfg.Logger.Level,
+		cfg.Logger.Format,
+		cfg.Logger.Output,
+		cfg.Logger.MaxSize,
+		cfg.Logger.MaxBackups,
+		cfg.Logger.MaxAge,
+		cfg.Logger.Compress,
+	)
+
+	// Initialize database
+	db, err := postgres.NewConnection(&cfg.Database)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Initialize Redis
+	redisClient, err := redis.NewConnection(&cfg.Redis)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to redis: %w", err)
+	}
+
+	// Initialize Kafka producer
+	producer := kafka.NewProducer(&cfg.Kafka, log)
+
+	// Initialize repositories
+	userRepo := postgresrepos.NewUserRepository(db)
+	sessionRepo := postgresrepos.NewSessionRepository(db)
+	roleRepo := postgresrepos.NewRoleRepository(db)
+
+	// Initialize auth utilities
+	passwordHasher := auth.NewPasswordHasher()
+	jwtManager := auth.NewJWTManager(
+		cfg.JWT.AccessTokenSecret,
+		cfg.JWT.RefreshTokenSecret,
+		cfg.JWT.Issuer,
+		cfg.JWT.Audience,
+	)
+
+	// Initialize services
+	authService := services.NewAuthService(
+		userRepo,
+		sessionRepo,
+		roleRepo,
+		passwordHasher,
+		jwtManager,
+		producer,
+		log,
+		cfg.JWT.AccessTokenExpiry,
+		cfg.JWT.RefreshTokenExpiry,
+	)
+	userService := services.NewUserService(userRepo, roleRepo, producer, log)
+
+	// Initialize HTTP handlers
+	authHandler := httphandlers.NewAuthHandler(authService, log)
+	userHandler := httphandlers.NewUserHandler(userService, log)
+	healthHandler := httphandlers.NewHealthHandler(db, redisClient, log)
+	authMiddleware := httpmiddleware.NewAuthMiddleware(jwtManager, log)
+
+	// Initialize gRPC handlers
+	authGRPCHandler := grpchandlers.NewAuthGRPCHandler(authService, log)
+	userGRPCHandler := grpchandlers.NewUserGRPCHandler(userService, log)
+	authInterceptor := grpcinterceptors.NewAuthInterceptor(jwtManager, log)
+	loggingInterceptor := grpcinterceptors.NewLoggingInterceptor(log)
+
+	// Initialize servers
+	httpSrv := httpserver.NewServer(
+		cfg,
+		authHandler,
+		userHandler,
+		healthHandler,
+		authMiddleware,
+		log,
+	)
+
+	grpcSrv := grpcserver.NewServer(
+		authGRPCHandler,
+		userGRPCHandler,
+		authInterceptor,
+		loggingInterceptor,
+		log,
+	)
+
 	return &App{
 		cfg:        cfg,
-		logger:     logger,
+		logger:     log,
 		db:         db,
-		redis:      redis,
+		redis:      redisClient,
 		producer:   producer,
-		httpServer: httpServer,
-		grpcServer: grpcServer,
-	}
+		httpServer: httpSrv,
+		grpcServer: grpcSrv,
+	}, nil
 }
 
 func (a *App) Run() error {

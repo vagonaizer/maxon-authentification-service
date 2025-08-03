@@ -1,4 +1,4 @@
-.PHONY: help build run test clean proto deps docker-build docker-run migrate lint format init wire reset
+.PHONY: help build run test clean proto deps docker-build docker-run migrate lint format init reset
 
 APP_NAME := auth-service
 VERSION := v1.0.0
@@ -14,7 +14,6 @@ reset: ## Reset and clean everything
 	rm -rf go.sum
 	rm -rf bin/
 	rm -rf api/proto/generated/*.pb.go
-	rm -f internal/app/wire_gen.go
 	go clean -modcache
 	go mod tidy
 	@echo "Project reset completed!"
@@ -49,8 +48,6 @@ deps-only: ## Install only Go dependencies (without proto generation)
 	@echo "Installing protoc plugins..."
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-	@echo "Installing Wire..."
-	go install github.com/google/wire/cmd/wire@latest
 
 proto-clean: ## Clean generated protobuf files
 	@echo "Cleaning generated protobuf files..."
@@ -68,24 +65,14 @@ proto: proto-clean ## Generate protobuf files
 		$(PROTO_DIR)/*.proto
 	@echo "Protobuf files generated successfully!"
 
-wire: ## Generate Wire dependency injection code
-	@echo "Generating Wire code..."
-	@cd internal/app && wire
-	@echo "Wire code generated successfully!"
+deps: deps-only proto ## Install dependencies and generate proto files
+	@echo "Dependencies and proto files ready!"
 
-deps: deps-only proto wire ## Install dependencies, generate proto files and Wire code
-	@echo "Dependencies, proto files, and Wire code ready!"
-
-build: ## Build the application (generates proto and wire if needed)
+build: ## Build the application (generates proto if needed)
 	@echo "Checking if proto files exist..."
 	@if [ ! -f "$(PROTO_OUT_DIR)/auth.pb.go" ] || [ ! -f "$(PROTO_OUT_DIR)/user.pb.go" ]; then \
 		echo "Proto files missing, generating..."; \
 		$(MAKE) proto; \
-	fi
-	@echo "Checking if Wire files exist..."
-	@if [ ! -f "internal/app/wire_gen.go" ]; then \
-		echo "Wire files missing, generating..."; \
-		$(MAKE) wire; \
 	fi
 	@echo "Building $(APP_NAME)..."
 	@mkdir -p bin
@@ -107,11 +94,6 @@ run-dev: ## Run the application in development mode
 	@if [ ! -f "$(PROTO_OUT_DIR)/auth.pb.go" ] || [ ! -f "$(PROTO_OUT_DIR)/user.pb.go" ]; then \
 		echo "Proto files missing, generating..."; \
 		$(MAKE) proto; \
-	fi
-	@echo "Checking if Wire files exist..."
-	@if [ ! -f "internal/app/wire_gen.go" ]; then \
-		echo "Wire files missing, generating..."; \
-		$(MAKE) wire; \
 	fi
 	@echo "Running $(APP_NAME) in development mode..."
 	go run cmd/server/main.go
@@ -137,7 +119,6 @@ clean: ## Clean build artifacts
 	rm -rf bin/
 	rm -rf coverage.out coverage.html
 	rm -rf $(PROTO_OUT_DIR)/*.pb.go
-	rm -f internal/app/wire_gen.go
 	go clean -cache
 	@echo "Clean completed"
 
@@ -169,7 +150,7 @@ docker-stop: ## Stop Docker Compose services
 	@echo "Stopping Docker Compose services..."
 	docker-compose down
 
-dev-setup: init deps-only proto wire ## Setup development environment
+dev-setup: init deps-only proto ## Setup development environment
 	@echo "Development environment setup completed!"
 	@echo "Next steps:"
 	@echo "1. Edit .env file with your configuration"
@@ -200,11 +181,5 @@ check-tools: ## Check if required tools are installed
 mod-tidy: ## Tidy go modules
 	@echo "Tidying go modules..."
 	go mod tidy
-
-fix-imports: ## Fix import issues
-	@echo "Fixing import issues..."
-	@find . -name "*.go" -not -path "./api/proto/generated/*" -exec sed -i.bak 's|timestamppbgo|timestamppb|g' {} \;
-	@find . -name "*.go.bak" -delete
-	@echo "Import issues fixed!"
 
 .DEFAULT_GOAL := help

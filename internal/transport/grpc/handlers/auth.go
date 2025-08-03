@@ -36,7 +36,11 @@ func (h *AuthGRPCHandler) Register(ctx context.Context, req *generated.RegisterR
 		LastName:  req.LastName,
 	}
 
-	result, err := h.authService.Register(ctx, registerReq)
+	// Для gRPC используем значения по умолчанию
+	ipAddress := "127.0.0.1"
+	userAgent := "gRPC-Client"
+
+	result, err := h.authService.Register(ctx, registerReq, ipAddress, userAgent)
 	if err != nil {
 		return nil, h.handleError(err)
 	}
@@ -72,7 +76,11 @@ func (h *AuthGRPCHandler) Login(ctx context.Context, req *generated.LoginRequest
 		Password: req.Password,
 	}
 
-	result, err := h.authService.Login(ctx, loginReq)
+	// Для gRPC используем значения по умолчанию
+	ipAddress := "127.0.0.1"
+	userAgent := "gRPC-Client"
+
+	result, err := h.authService.Login(ctx, loginReq, ipAddress, userAgent)
 	if err != nil {
 		return nil, h.handleError(err)
 	}

@@ -2,9 +2,11 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 	"github.com/vagonaizer/authenitfication-service/internal/domain/entities"
 	"github.com/vagonaizer/authenitfication-service/internal/domain/repositories"
 	"github.com/vagonaizer/authenitfication-service/internal/dto/request"
@@ -16,7 +18,7 @@ import (
 	"github.com/vagonaizer/authenitfication-service/pkg/utils"
 )
 
-type authService struct {
+type AuthService struct {
 	userRepo       repositories.UserRepository
 	sessionRepo    repositories.SessionRepository
 	roleRepo       repositories.RoleRepository
@@ -36,9 +38,10 @@ func NewAuthService(
 	jwtManager *auth.JWTManager,
 	producer *kafka.Producer,
 	logger *logger.Logger,
-	accessExpiry, refreshExpiry time.Duration,
-) *authService {
-	return &authService{
+	accessExpiry time.Duration,
+	refreshExpiry time.Duration,
+) *AuthService {
+	return &AuthService{
 		userRepo:       userRepo,
 		sessionRepo:    sessionRepo,
 		roleRepo:       roleRepo,
@@ -51,7 +54,7 @@ func NewAuthService(
 	}
 }
 
-func (s *authService) Register(ctx context.Context, req *request.RegisterRequest) (*response.AuthResponse, error) {
+func (s *AuthService) Register(ctx context.Context, req *request.RegisterRequest, ipAddress, userAgent string) (*response.AuthResponse, error) {
 	if !utils.IsValidEmail(req.Email) {
 		return nil, errors.Validation("invalid email format")
 	}
@@ -101,6 +104,7 @@ func (s *authService) Register(ctx context.Context, req *request.RegisterRequest
 		return nil, err
 	}
 
+	// Назначаем роль по умолчанию (игнорируем ошибки)
 	defaultRole, err := s.roleRepo.GetByName(ctx, "user")
 	if err != nil {
 		s.logger.WithError(err).Warn("failed to get default role")
@@ -110,7 +114,13 @@ func (s *authService) Register(ctx context.Context, req *request.RegisterRequest
 		}
 	}
 
-	userRoles, _ := s.roleRepo.GetUserRoles(ctx, user.ID)
+	// Получаем роли пользователя (с обработкой ошибок)
+	userRoles, err := s.roleRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		s.logger.WithError(err).Warn("failed to get user roles, using empty roles")
+		userRoles = []*entities.Role{}
+	}
+
 	roleNames := make([]string, len(userRoles))
 	for i, role := range userRoles {
 		roleNames[i] = role.Name
@@ -122,7 +132,8 @@ func (s *authService) Register(ctx context.Context, req *request.RegisterRequest
 		return nil, errors.Internal("failed to generate tokens")
 	}
 
-	refreshToken, err := s.jwtManager.GenerateRefreshToken(user.ID, s.refreshExpiry)
+	// Генерируем короткий refresh token
+	refreshToken, err := utils.GenerateSecureToken()
 	if err != nil {
 		s.logger.WithError(err).Error("failed to generate refresh token")
 		return nil, errors.Internal("failed to generate tokens")
@@ -132,6 +143,8 @@ func (s *authService) Register(ctx context.Context, req *request.RegisterRequest
 		ID:           uuid.New(),
 		UserID:       user.ID,
 		RefreshToken: refreshToken,
+		UserAgent:    userAgent,
+		IPAddress:    ipAddress,
 		IsActive:     true,
 		ExpiresAt:    time.Now().Add(s.refreshExpiry),
 	}
@@ -140,6 +153,7 @@ func (s *authService) Register(ctx context.Context, req *request.RegisterRequest
 		return nil, err
 	}
 
+	// Публикуем событие (игнорируем ошибки)
 	event := kafka.UserRegisteredEvent{
 		BaseEvent: kafka.NewBaseEvent(kafka.TopicUserRegistered),
 		UserID:    user.ID,
@@ -173,71 +187,129 @@ func (s *authService) Register(ctx context.Context, req *request.RegisterRequest
 	}, nil
 }
 
-func (s *authService) Login(ctx context.Context, req *request.LoginRequest) (*response.AuthResponse, error) {
+func (s *AuthService) Login(ctx context.Context, req *request.LoginRequest, ipAddress, userAgent string) (*response.AuthResponse, error) {
+	s.logger.WithFields(logger.Fields{
+		"email": req.Email,
+		"ip":    ipAddress,
+	}).Info("login attempt started")
+
+	// Шаг 1: Получение пользователя
 	user, err := s.userRepo.GetByEmail(ctx, utils.NormalizeEmail(req.Email))
 	if err != nil {
+		s.logger.WithError(err).WithField("email", req.Email).Error("failed to get user by email")
 		return nil, errors.InvalidCredentials()
 	}
+	s.logger.WithField("user_id", user.ID).Info("user found")
 
+	// Шаг 2: Проверка активности пользователя
 	if !user.IsActive {
+		s.logger.WithField("user_id", user.ID).Warn("inactive user login attempt")
 		return nil, errors.UserInactive()
 	}
 
+	// Шаг 3: Проверка пароля
+	s.logger.WithField("user_id", user.ID).Info("verifying password")
 	valid, err := s.passwordHasher.VerifyPassword(req.Password, user.PasswordHash)
 	if err != nil {
-		s.logger.WithError(err).Error("failed to verify password")
+		s.logger.WithError(err).WithField("user_id", user.ID).Error("failed to verify password")
 		return nil, errors.Internal("authentication failed")
 	}
 
 	if !valid {
+		s.logger.WithField("user_id", user.ID).Warn("invalid password")
 		return nil, errors.InvalidCredentials()
 	}
+	s.logger.WithField("user_id", user.ID).Info("password verified successfully")
 
+	// Шаг 4: Обновление времени последнего входа
 	now := time.Now()
 	user.LastLoginAt = &now
 	if err := s.userRepo.Update(ctx, user); err != nil {
-		s.logger.WithError(err).Warn("failed to update last login time")
+		s.logger.WithError(err).WithField("user_id", user.ID).Warn("failed to update last login time")
 	}
 
-	userRoles, _ := s.roleRepo.GetUserRoles(ctx, user.ID)
+	// Шаг 5: Получение ролей пользователя
+	s.logger.WithField("user_id", user.ID).Info("getting user roles")
+	userRoles, err := s.roleRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		s.logger.WithError(err).WithField("user_id", user.ID).Error("failed to get user roles")
+		return nil, errors.DatabaseError(fmt.Errorf("failed to retrieve user roles: %w", err))
+	}
+
 	roleNames := make([]string, len(userRoles))
 	for i, role := range userRoles {
 		roleNames[i] = role.Name
 	}
+	s.logger.WithFields(logger.Fields{
+		"user_id": user.ID,
+		"roles":   roleNames,
+	}).Info("user roles retrieved")
 
+	// Шаг 6: Генерация токенов
+	s.logger.WithField("user_id", user.ID).Info("generating access token")
 	accessToken, err := s.jwtManager.GenerateAccessToken(user.ID, user.Email, user.Username, roleNames, s.accessExpiry)
 	if err != nil {
-		s.logger.WithError(err).Error("failed to generate access token")
+		s.logger.WithError(err).WithField("user_id", user.ID).Error("failed to generate access token")
 		return nil, errors.Internal("failed to generate tokens")
 	}
 
-	refreshToken, err := s.jwtManager.GenerateRefreshToken(user.ID, s.refreshExpiry)
+	s.logger.WithField("user_id", user.ID).Info("generating refresh token")
+	// Генерируем короткий refresh token
+	refreshToken, err := utils.GenerateSecureToken()
 	if err != nil {
-		s.logger.WithError(err).Error("failed to generate refresh token")
+		s.logger.WithError(err).WithField("user_id", user.ID).Error("failed to generate refresh token")
 		return nil, errors.Internal("failed to generate tokens")
 	}
+
+	// Шаг 7: Создание сессии
+	s.logger.WithFields(logger.Fields{
+		"user_id":              user.ID,
+		"ip_address":           ipAddress,
+		"user_agent":           userAgent,
+		"refresh_token_length": len(refreshToken),
+	}).Info("creating session")
 
 	session := &entities.Session{
 		ID:           uuid.New(),
 		UserID:       user.ID,
 		RefreshToken: refreshToken,
+		UserAgent:    userAgent,
+		IPAddress:    ipAddress,
 		IsActive:     true,
 		ExpiresAt:    time.Now().Add(s.refreshExpiry),
 	}
 
 	if err := s.sessionRepo.Create(ctx, session); err != nil {
-		return nil, err
+		s.logger.WithError(err).WithFields(logrus.Fields{
+			"user_id":              user.ID,
+			"session_id":           session.ID,
+			"ip_address":           ipAddress,
+			"user_agent":           userAgent,
+			"expires_at":           session.ExpiresAt,
+			"refresh_token_length": len(refreshToken),
+		}).Error("failed to create session")
+		return nil, errors.DatabaseError(fmt.Errorf("failed to create session: %w", err))
 	}
 
+	s.logger.WithFields(logger.Fields{
+		"user_id":    user.ID,
+		"session_id": session.ID,
+	}).Info("session created successfully")
+
+	// Шаг 8: Публикация события (игнорируем ошибки)
 	event := kafka.UserLoggedInEvent{
 		BaseEvent: kafka.NewBaseEvent(kafka.TopicUserLoggedIn),
 		UserID:    user.ID,
 		Email:     user.Email,
+		IPAddress: ipAddress,
+		UserAgent: userAgent,
 	}
 
 	if err := s.producer.PublishMessage(ctx, kafka.TopicUserLoggedIn, user.ID.String(), event); err != nil {
 		s.logger.WithError(err).Warn("failed to publish user logged in event")
 	}
+
+	s.logger.WithField("user_id", user.ID).Info("login completed successfully")
 
 	return &response.AuthResponse{
 		AccessToken:  accessToken,
@@ -259,12 +331,8 @@ func (s *authService) Login(ctx context.Context, req *request.LoginRequest) (*re
 	}, nil
 }
 
-func (s *authService) RefreshToken(ctx context.Context, req *request.RefreshTokenRequest) (*response.TokenResponse, error) {
-	claims, err := s.jwtManager.ValidateRefreshToken(req.RefreshToken)
-	if err != nil {
-		return nil, errors.TokenInvalid()
-	}
-
+func (s *AuthService) RefreshToken(ctx context.Context, req *request.RefreshTokenRequest) (*response.TokenResponse, error) {
+	// Для простых refresh токенов проверяем через базу данных
 	session, err := s.sessionRepo.GetByRefreshToken(ctx, req.RefreshToken)
 	if err != nil {
 		return nil, errors.TokenInvalid()
@@ -274,7 +342,7 @@ func (s *authService) RefreshToken(ctx context.Context, req *request.RefreshToke
 		return nil, errors.TokenExpired()
 	}
 
-	user, err := s.userRepo.GetByID(ctx, claims.UserID)
+	user, err := s.userRepo.GetByID(ctx, session.UserID)
 	if err != nil {
 		return nil, errors.UserNotFound()
 	}
@@ -283,7 +351,13 @@ func (s *authService) RefreshToken(ctx context.Context, req *request.RefreshToke
 		return nil, errors.UserInactive()
 	}
 
-	userRoles, _ := s.roleRepo.GetUserRoles(ctx, user.ID)
+	// Получаем роли пользователя (с обработкой ошибок)
+	userRoles, err := s.roleRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		s.logger.WithError(err).WithField("user_id", user.ID).Warn("failed to get user roles, using empty roles")
+		userRoles = []*entities.Role{}
+	}
+
 	roleNames := make([]string, len(userRoles))
 	for i, role := range userRoles {
 		roleNames[i] = role.Name
@@ -302,7 +376,7 @@ func (s *authService) RefreshToken(ctx context.Context, req *request.RefreshToke
 	}, nil
 }
 
-func (s *authService) Logout(ctx context.Context, req *request.LogoutRequest) error {
+func (s *AuthService) Logout(ctx context.Context, req *request.LogoutRequest) error {
 	session, err := s.sessionRepo.GetByRefreshToken(ctx, req.RefreshToken)
 	if err != nil {
 		return nil
@@ -325,7 +399,7 @@ func (s *authService) Logout(ctx context.Context, req *request.LogoutRequest) er
 	return nil
 }
 
-func (s *authService) LogoutAll(ctx context.Context, userID string) error {
+func (s *AuthService) LogoutAll(ctx context.Context, userID string) error {
 	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return errors.Validation("invalid user ID")
@@ -338,7 +412,7 @@ func (s *authService) LogoutAll(ctx context.Context, userID string) error {
 	return nil
 }
 
-func (s *authService) VerifyToken(ctx context.Context, token string) (*response.TokenClaimsResponse, error) {
+func (s *AuthService) VerifyToken(ctx context.Context, token string) (*response.TokenClaimsResponse, error) {
 	claims, err := s.jwtManager.ValidateAccessToken(token)
 	if err != nil {
 		return nil, errors.TokenInvalid()
@@ -354,7 +428,7 @@ func (s *authService) VerifyToken(ctx context.Context, token string) (*response.
 	}, nil
 }
 
-func (s *authService) ChangePassword(ctx context.Context, req *request.ChangePasswordRequest) error {
+func (s *AuthService) ChangePassword(ctx context.Context, req *request.ChangePasswordRequest) error {
 	userID, err := uuid.Parse(req.UserID)
 	if err != nil {
 		return errors.Validation("invalid user ID")
@@ -407,7 +481,7 @@ func (s *authService) ChangePassword(ctx context.Context, req *request.ChangePas
 	return nil
 }
 
-func (s *authService) ResetPassword(ctx context.Context, req *request.ResetPasswordRequest) error {
+func (s *AuthService) ResetPassword(ctx context.Context, req *request.ResetPasswordRequest) error {
 	_, err := s.userRepo.GetByEmail(ctx, utils.NormalizeEmail(req.Email))
 	if err != nil {
 		return nil
@@ -416,6 +490,6 @@ func (s *authService) ResetPassword(ctx context.Context, req *request.ResetPassw
 	return nil
 }
 
-func (s *authService) ConfirmResetPassword(ctx context.Context, req *request.ConfirmResetPasswordRequest) error {
+func (s *AuthService) ConfirmResetPassword(ctx context.Context, req *request.ConfirmResetPasswordRequest) error {
 	return nil
 }

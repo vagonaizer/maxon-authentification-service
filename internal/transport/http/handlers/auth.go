@@ -41,7 +41,14 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		})
 	}
 
-	result, err := h.authService.Register(c.Request().Context(), &req)
+	// Получаем IP адрес и User Agent из запроса
+	ipAddress := c.RealIP()
+	if ipAddress == "" {
+		ipAddress = "127.0.0.1"
+	}
+	userAgent := c.Request().UserAgent()
+
+	result, err := h.authService.Register(c.Request().Context(), &req, ipAddress, userAgent)
 	if err != nil {
 		if appErr, ok := err.(*errors.AppError); ok {
 			return c.JSON(appErr.StatusCode, response.ErrorResponse{
@@ -79,7 +86,14 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		})
 	}
 
-	result, err := h.authService.Login(c.Request().Context(), &req)
+	// Получаем IP адрес и User Agent из запроса
+	ipAddress := c.RealIP()
+	if ipAddress == "" {
+		ipAddress = "127.0.0.1"
+	}
+	userAgent := c.Request().UserAgent()
+
+	result, err := h.authService.Login(c.Request().Context(), &req, ipAddress, userAgent)
 	if err != nil {
 		if appErr, ok := err.(*errors.AppError); ok {
 			return c.JSON(appErr.StatusCode, response.ErrorResponse{

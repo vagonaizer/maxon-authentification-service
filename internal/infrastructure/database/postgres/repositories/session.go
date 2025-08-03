@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"database/sql"
+	"net"
 
 	"github.com/google/uuid"
 	"github.com/vagonaizer/authenitfication-service/internal/domain/entities"
@@ -10,15 +11,34 @@ import (
 	"github.com/vagonaizer/authenitfication-service/pkg/errors"
 )
 
-type sessionRepository struct {
+type SessionRepository struct {
 	db *postgres.DB
 }
 
-func NewSessionRepository(db *postgres.DB) *sessionRepository {
-	return &sessionRepository{db: db}
+func NewSessionRepository(db *postgres.DB) *SessionRepository {
+	return &SessionRepository{db: db}
 }
 
-func (r *sessionRepository) Create(ctx context.Context, session *entities.Session) error {
+func (r *SessionRepository) Create(ctx context.Context, session *entities.Session) error {
+	// Обработка IP адреса
+	var ipAddress interface{}
+	if session.IPAddress == "" {
+		ipAddress = "127.0.0.1"
+	} else {
+		// Проверяем, что IP адрес валидный
+		if ip := net.ParseIP(session.IPAddress); ip != nil {
+			ipAddress = session.IPAddress
+		} else {
+			ipAddress = "127.0.0.1"
+		}
+	}
+
+	// Обработка User Agent
+	userAgent := session.UserAgent
+	if userAgent == "" {
+		userAgent = "Unknown"
+	}
+
 	query := `
 		INSERT INTO sessions (id, user_id, refresh_token, user_agent, ip_address, is_active, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -26,17 +46,21 @@ func (r *sessionRepository) Create(ctx context.Context, session *entities.Sessio
 
 	err := r.db.QueryRowContext(ctx, query,
 		session.ID, session.UserID, session.RefreshToken,
-		session.UserAgent, session.IPAddress, session.IsActive, session.ExpiresAt,
+		userAgent, ipAddress, session.IsActive, session.ExpiresAt,
 	).Scan(&session.CreatedAt, &session.UpdatedAt)
 
 	if err != nil {
 		return errors.DatabaseError(err)
 	}
 
+	// Обновляем поля в структуре
+	session.IPAddress = ipAddress.(string)
+	session.UserAgent = userAgent
+
 	return nil
 }
 
-func (r *sessionRepository) GetByID(ctx context.Context, id uuid.UUID) (*entities.Session, error) {
+func (r *SessionRepository) GetByID(ctx context.Context, id uuid.UUID) (*entities.Session, error) {
 	session := &entities.Session{}
 	query := `
 		SELECT id, user_id, refresh_token, user_agent, ip_address, is_active, expires_at, created_at, updated_at
@@ -59,7 +83,7 @@ func (r *sessionRepository) GetByID(ctx context.Context, id uuid.UUID) (*entitie
 	return session, nil
 }
 
-func (r *sessionRepository) GetByRefreshToken(ctx context.Context, refreshToken string) (*entities.Session, error) {
+func (r *SessionRepository) GetByRefreshToken(ctx context.Context, refreshToken string) (*entities.Session, error) {
 	session := &entities.Session{}
 	query := `
 		SELECT id, user_id, refresh_token, user_agent, ip_address, is_active, expires_at, created_at, updated_at
@@ -82,7 +106,7 @@ func (r *sessionRepository) GetByRefreshToken(ctx context.Context, refreshToken 
 	return session, nil
 }
 
-func (r *sessionRepository) GetActiveByUserID(ctx context.Context, userID uuid.UUID) ([]*entities.Session, error) {
+func (r *SessionRepository) GetActiveByUserID(ctx context.Context, userID uuid.UUID) ([]*entities.Session, error) {
 	query := `
 		SELECT id, user_id, refresh_token, user_agent, ip_address, is_active, expires_at, created_at, updated_at
 		FROM sessions 
@@ -116,7 +140,7 @@ func (r *sessionRepository) GetActiveByUserID(ctx context.Context, userID uuid.U
 	return sessions, nil
 }
 
-func (r *sessionRepository) Update(ctx context.Context, session *entities.Session) error {
+func (r *SessionRepository) Update(ctx context.Context, session *entities.Session) error {
 	query := `
 		UPDATE sessions 
 		SET user_agent = $2, ip_address = $3, is_active = $4, expires_at = $5
@@ -138,7 +162,7 @@ func (r *sessionRepository) Update(ctx context.Context, session *entities.Sessio
 	return nil
 }
 
-func (r *sessionRepository) Delete(ctx context.Context, id uuid.UUID) error {
+func (r *SessionRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	query := `DELETE FROM sessions WHERE id = $1`
 
 	result, err := r.db.ExecContext(ctx, query, id)
@@ -158,7 +182,7 @@ func (r *sessionRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (r *sessionRepository) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
+func (r *SessionRepository) DeleteByUserID(ctx context.Context, userID uuid.UUID) error {
 	query := `DELETE FROM sessions WHERE user_id = $1`
 
 	_, err := r.db.ExecContext(ctx, query, userID)
@@ -169,7 +193,7 @@ func (r *sessionRepository) DeleteByUserID(ctx context.Context, userID uuid.UUID
 	return nil
 }
 
-func (r *sessionRepository) DeleteExpired(ctx context.Context) error {
+func (r *SessionRepository) DeleteExpired(ctx context.Context) error {
 	query := `DELETE FROM sessions WHERE expires_at < CURRENT_TIMESTAMP`
 
 	_, err := r.db.ExecContext(ctx, query)
